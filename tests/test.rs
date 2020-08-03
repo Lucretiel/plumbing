@@ -1,5 +1,5 @@
 use futures::{channel::mpsc, future::FutureExt, StreamExt};
-use pipette::Pipeline;
+use plumbing::Pipeline;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -224,7 +224,7 @@ mod fake_db_test {
         future::{self},
         sink::SinkExt,
     };
-    use pipette::Pipeline;
+    use plumbing::Pipeline;
 
     /// Test a typical interaction with the fake_db
     #[tokio::test]
