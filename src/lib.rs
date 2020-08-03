@@ -93,6 +93,11 @@ impl<St> ResolverState<St> {
 /// be awaited in order to receive the responses; later Resolvers will block
 /// indefinitely until earlier Resolvers have returned their responses.
 ///
+/// If the [`Stream`] used by the [`Pipeline`] to retrieve responses closes
+/// prematurely, all remaining (and new) Resolvers will return `None`. Ideally
+/// this shouldn't happen; the stream should return Some(Err(...)) to each
+/// resolver in the event of (for example) an unrecoverable connection failure.
+///
 /// If a `Resolver` is dropped, the response associated with it will simply
 /// be discarded.
 #[derive(Debug)]
