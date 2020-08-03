@@ -82,12 +82,11 @@ impl<St> ResolverState<St> {
     }
 }
 
-/// A `Future` that retrieves the response associated with a request submitted
-/// through a [`Pipeline`].
+/// A [`Future`] associated with a request submitted through a [`Pipeline`].
 ///
 /// When you successfully submit a request to a [`Pipeline`], it returns a
 /// `Resolver` that can be awaited to retrieve the response for that request.
-/// Because responses are received in order and lazily, *each* `Resolver` must
+/// Because responses are retrieved lazily and in order, *each* `Resolver` must
 /// be awaited in order to receive the responses; later Resolvers will block
 /// indefinitely until earlier Resolvers have returned their responses.
 ///
