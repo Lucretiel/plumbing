@@ -3,7 +3,7 @@ use futures::{
     future::{self, FutureExt},
     StreamExt,
 };
-use request_stream::Pipeline;
+use pipette::Pipeline;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -240,7 +240,7 @@ mod fake_db_test {
         future::{self},
         sink::SinkExt,
     };
-    use request_stream::Pipeline;
+    use pipette::Pipeline;
 
     /// Test a typical interaction with the fake_db
     #[tokio::test]
