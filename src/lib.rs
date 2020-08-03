@@ -140,7 +140,7 @@ impl<St: Stream + Unpin> Future for Resolver<St> {
                     // Resolvers, then return it.
                     None => {
                         this.state = ResolverState::Dead;
-                        return Poll::Ready(None);
+                        Poll::Ready(None)
                     }
 
                     // The previous Resolver has finished, which means it's our turn to drink
@@ -205,10 +205,7 @@ impl<St: Stream + Unpin> Future for Resolver<St> {
 
 impl<St: Stream + Unpin> FusedFuture for Resolver<St> {
     fn is_terminated(&self) -> bool {
-        match self.state {
-            ResolverState::Dead => true,
-            _ => false,
-        }
+        matches!(self.state, ResolverState::Dead)
     }
 }
 
