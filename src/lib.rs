@@ -1,3 +1,4 @@
+use future::FusedFuture;
 use futures::{channel::oneshot, future, ready, Sink, Stream, StreamExt};
 use std::{
     future::Future,
@@ -9,11 +10,6 @@ use std::{
 type ChainSend<St> = oneshot::Sender<ResolverChainItem<St>>;
 type ChainRecv<St> = oneshot::Receiver<ResolverChainItem<St>>;
 
-/// A Resolver operates in two phases: first, it waits for the previous
-/// Resolver in the chain to send along the stream; then, it waits for the
-/// next item in the stream. However, if a Resolver is dropped and the chain
-/// is broken, it sends its receiver to the next Resolver. This enum captures
-/// the two things that a Resolver may need to send down the chain.
 #[derive(Debug)]
 enum ResolverChainItem<St> {
     Reconnect { recv: ChainRecv<St>, skip: u32 },
@@ -61,100 +57,120 @@ impl<St: Stream + Unpin> Future for Resolver<St> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        loop {
-            match this.state {
-                ResolverState::Dead => panic!("Can't re-poll a completed future"),
+        // Some design notes for this function:
+        // - We try to be as conservative as possible with writes; this means
+        //   we don't modify the state until we *know* it's changing. We don't
+        //   .take() the state, process it, then restore it. This allows us
+        //   to ensure the state remains consistent even through ready! calls
+        //   and possible panics.
+        // - We could loop here until we receive a Pending from one of our
+        //   inner polls or until we're ready, but we don't want to starve
+        //   the event loop, so we do at most one state update, then auto
+        //   awaken the context if we can continue to make progress.
 
-                // The chain state means a previous receiver in the chain has the stream
-                // right now, and we're waiting for it to eventually come to use. Additionally,
-                // We may receive "reconnect" messages, which indicate that our previous
-                // resolver is aborting and is sending ITS previous resolver to ensure the
-                // chain isn't broken
-                ResolverState::Chain { ref mut recv, .. } => {
-                    let mut pinned = Pin::new(recv);
-                    match ready!(pinned.as_mut().poll(cx)) {
-                        // Our channel was closed without a send, indicating the stream returned
-                        // None at some point. Clear our state to propagate the None to future
-                        // Resolvers, then return it.
-                        Err(..) => {
-                            this.state = ResolverState::Dead;
-                            break Poll::Ready(None);
-                        }
+        match this.state {
+            ResolverState::Dead => panic!("Can't re-poll a completed future"),
 
-                        // The previous Resolver in the chain has aborted, and is sending us *its*
-                        // receiver, along with its skip count (including itself)
-                        Ok(ResolverChainItem::Reconnect {
-                            recv: new_recv,
-                            skip,
-                        }) => {
-                            let recv = pinned.get_mut();
-                            *recv = new_recv;
+            // The chain state means a previous receiver in the chain has the stream
+            // right now, and we're waiting for it to eventually come to use. Additionally,
+            // We may receive "reconnect" messages, which indicate that our previous
+            // resolver is aborting and is sending ITS previous resolver to ensure the
+            // chain isn't broken (along with a skip count, indicating the total number
+            // of items from the stream that are associated with aborted resolvers and
+            // need to be discarded).
+            ResolverState::Chain { ref mut recv, .. } => {
+                let mut pinned = Pin::new(recv);
+                match ready!(pinned.as_mut().poll(cx)) {
+                    // Our channel was closed without a send, indicating the stream returned
+                    // None at some point. Clear our state to propagate the None to future
+                    // Resolvers, then return it.
+                    Err(..) => {
+                        this.state = ResolverState::Dead;
+                        return Poll::Ready(None);
+                    }
+
+                    // The previous Resolver in the chain has aborted, and is sending us *its*
+                    // receiver, along with its skip count (including itself)
+                    Ok(ResolverChainItem::Reconnect {
+                        recv: new_recv,
+                        skip,
+                    }) => {
+                        let recv = pinned.get_mut();
+                        *recv = new_recv;
+                        this.skip += skip;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+
+                    // The previous Resolver has finished, which means it's our turn to drink
+                    // from the stream. It's sent us the stream, along with a skip count in
+                    // the event it aborted early.
+                    Ok(ResolverChainItem::Stream { stream, skip }) => match this.state.take() {
+                        ResolverState::Chain { send, .. } => {
+                            this.state = ResolverState::Stream { stream, send };
                             this.skip += skip;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
                         }
-
-                        // The previous Resolver has finished, which means it's our turn to drink
-                        // from the stream. It's sent us the stream, along with a skip count in
-                        // the event it aborted early.
-                        Ok(ResolverChainItem::Stream { stream, skip }) => {
-                            // TODO: dedupe this?
-                            match this.state.take() {
-                                ResolverState::Chain { send, .. } => {
-                                    this.state = ResolverState::Stream { stream, send };
-                                    this.skip += skip;
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                    }
+                        _ => unreachable!(),
+                    },
                 }
+            }
 
-                // We are the current holder of the stream, so we're waiting for our element.
-                // If we have a skip, that means previous Resolvers aborted without resolving,
-                // which means that we need to take and discard that many elements before
-                // claiming our own.
-                ResolverState::Stream { ref mut stream, .. } => {
-                    match ready!(Pin::new(stream).poll_next(cx)) {
-                        // Stream ended. Clear the state and return the None.
-                        // Clearing the state will close the send channel, which
-                        // will in activate the next Resolver in the chain and
-                        // so on.
-                        None => {
-                            this.state = ResolverState::Dead;
-                            break Poll::Ready(None);
-                        }
-
-                        // We got an item, but we still have skips, which means
-                        // it's an item associated with a previous aborted Resolver.
-                        // Update skip and retry the loop.
-                        Some(..) if this.skip > 0 => this.skip -= 1,
-
-                        // We got our item! Send the stream down the line, then
-                        // clear our own state and return it
-                        Some(item) => match this.state.take() {
-                            ResolverState::Stream { stream, send } => {
-                                // If the send channel is closed, that means that
-                                // it was part of the pipeline, which was dropped.
-                                // we can therefore silently let this send fail.
-                                let _ = send.send(ResolverChainItem::Stream { stream, skip: 0 });
-                                break Poll::Ready(Some(item));
-                            }
-                            _ => unreachable!(),
-                        },
+            // We are the current holder of the stream, so we're waiting for our element.
+            // If we have a skip, that means previous Resolvers aborted without resolving,
+            // which means that we need to take and discard that many elements before
+            // claiming our own.
+            ResolverState::Stream { ref mut stream, .. } => {
+                match ready!(Pin::new(stream).poll_next(cx)) {
+                    // Stream ended. Clear the state and return the None.
+                    // Clearing the state will close the send channel, which
+                    // will in activate the next Resolver in the chain and
+                    // so on.
+                    None => {
+                        this.state = ResolverState::Dead;
+                        Poll::Ready(None)
                     }
+
+                    // We got an item, but we still have skips, which means
+                    // it's an item associated with a previous aborted Resolver.
+                    // Update skip and retry the loop.
+                    Some(..) if this.skip > 0 => {
+                        this.skip -= 1;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+
+                    // We got our item! Send the stream down the line, then
+                    // clear our own state and return it
+                    Some(item) => match this.state.take() {
+                        ResolverState::Stream { stream, send } => {
+                            // If the send channel is closed, that means that
+                            // it was part of the pipeline, which was dropped.
+                            // we can therefore silently let this send fail.
+                            let _ = send.send(ResolverChainItem::Stream { stream, skip: 0 });
+                            Poll::Ready(Some(item))
+                        }
+                        _ => unreachable!(),
+                    },
                 }
             }
         }
     }
 }
 
+impl<St: Stream + Unpin> FusedFuture for Resolver<St> {
+    fn is_terminated(&self) -> bool {
+        match self.state {
+            ResolverState::Dead => true,
+            _ => false,
+        }
+    }
+}
+
 impl<St: Stream + Unpin> Drop for Resolver<St> {
     fn drop(&mut self) {
-        // If our send slot has been consumed, we already sent something,
-        // so there's no work to be done. Hypothetically there are invalid
-        // state combinations between send and state, but we don't worry
-        // about them.
         let (send, item) = match self.state.take() {
-            ResolverState::Dead => return,
             // We're "breaking" the chain, so we have to forward our recv
             // end down to the next Resolver. Increment skip so that the next
             // Resolver knows to skip our element.
@@ -176,12 +192,15 @@ impl<St: Stream + Unpin> Drop for Resolver<St> {
                     skip: self.skip + 1,
                 },
             ),
+
+            ResolverState::Dead => return,
         };
 
         let _ = send.send(item);
     }
 }
 
+/// A pipeline manages sending requests
 #[derive(Debug)]
 pub struct Pipeline<Si: Unpin, St: Unpin> {
     sink: Si,
@@ -234,6 +253,15 @@ impl<Si: Unpin, St: Unpin> Pipeline<Si, St> {
         };
 
         Ok(resolver)
+    }
+
+    pub async fn submit_owned<T>(mut self, item: T) -> (Self, Result<Resolver<St>, Si::Error>)
+    where
+        Si: Sink<T>,
+        St: Stream,
+    {
+        let res = self.submit(item).await;
+        (self, res)
     }
 
     pub async fn flush<'a, T>(&mut self) -> Result<(), Si::Error>
