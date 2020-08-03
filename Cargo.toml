@@ -11,8 +11,10 @@ repository = "https://github.com/Lucretiel/lazy_format"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# Remember: try to keep dependency features minimal!
 [dependencies]
-futures = { version = "0.3.5", default-features = false, features = ["std"] }
+futures = { version = "0.3.5", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+futures = { version = "0.3.5", default-features = false, features = ["std"] }
 tokio = { version = "0.2.22", default-features = false, features = ["rt-threaded", "macros", "rt-util"]}

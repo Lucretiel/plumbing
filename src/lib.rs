@@ -1,15 +1,18 @@
+#![no_std]
+
+use core::{
+    future::Future,
+    mem,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use futures::{
     channel::oneshot,
     future::{self, FusedFuture},
     ready,
     stream::Skip,
     FutureExt, Sink, SinkExt, Stream, StreamExt,
-};
-use std::{
-    future::Future,
-    mem,
-    pin::Pin,
-    task::{Context, Poll},
 };
 
 type ChainSend<St> = oneshot::Sender<ResolverChainItem<St>>;
