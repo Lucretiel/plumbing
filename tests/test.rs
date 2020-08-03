@@ -223,6 +223,7 @@ mod fake_db_test {
     use futures::{
         future::{self},
         sink::SinkExt,
+        FutureExt,
     };
     use plumbing::Pipeline;
 
@@ -261,5 +262,39 @@ mod fake_db_test {
         flush_result.unwrap();
 
         assert_eq!(query_result.unwrap(), Response::Value(114));
+    }
+
+    #[tokio::test]
+    async fn test_fake_db_two_queries() {
+        let (send, recv) = fake_db::create_db();
+        let send = send.buffer(20);
+        let pipeline = Pipeline::new(send, recv);
+
+        // Submit the first request pipeline
+        let (pipeline, query1) = pipeline
+            .submit_owned(Request::Set(10))
+            .then(|(pipe, _)| pipe.submit_owned(Request::Incr(2)))
+            .then(|(pipe, _)| pipe.submit_owned(Request::Incr(2)))
+            .then(|(pipe, _)| pipe.submit_owned(Request::Get))
+            .await;
+
+        let query1 = query1.unwrap();
+
+        // Submit the second request pipeline
+        let (mut pipeline, query2) = pipeline
+            .submit_owned(Request::Decr(4))
+            .then(|(pipe, _)| pipe.submit_owned(Request::Decr(4)))
+            .then(|(pipe, _)| pipe.submit_owned(Request::Decr(4)))
+            .then(|(pipe, _)| pipe.submit_owned(Request::Get))
+            .await;
+
+        let query2 = query2.unwrap();
+
+        // Flush the pipeline and retrieve the query results
+        let (res1, res2, flush_res) = future::join3(query1, query2, pipeline.flush()).await;
+        flush_res.unwrap();
+
+        assert_eq!(res1.unwrap(), Response::Value(14));
+        assert_eq!(res2.unwrap(), Response::Value(2));
     }
 }
