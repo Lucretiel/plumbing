@@ -1,8 +1,4 @@
-use futures::{
-    channel::mpsc,
-    future::{self, FutureExt},
-    StreamExt,
-};
+use futures::{channel::mpsc, future::FutureExt, StreamExt};
 use pipette::Pipeline;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -26,37 +22,6 @@ async fn basic_test() {
     assert_eq!(slot3.await.unwrap(), 3);
 }
 
-#[tokio::test]
-async fn basic_test_owned() {
-    let (send, recv) = mpsc::unbounded();
-    let pipeline = Pipeline::new(send, recv);
-
-    pipeline
-        // Submit a 1
-        .submit_owned(1i32)
-        // Get slot1, submit 2
-        .then(|(pipeline, slot1)| {
-            pipeline
-                .submit_owned(2)
-                .map(move |(pipe, slot2)| (pipe, slot1, slot2))
-        })
-        // Get slot2, submit 3
-        .then(|(pipeline, slot1, slot2)| {
-            pipeline
-                .submit_owned(3)
-                .map(move |(_pipe, slot3)| (slot1, slot2, slot3))
-        })
-        // Await all 3 slots
-        .then(|(slot1, slot2, slot3)| future::join3(slot1.unwrap(), slot2.unwrap(), slot3.unwrap()))
-        // Check their values
-        .map(|(value1, value2, value3)| {
-            assert_eq!(value1.unwrap(), 1);
-            assert_eq!(value2.unwrap(), 2);
-            assert_eq!(value3.unwrap(), 3);
-        })
-        .await;
-}
-
 /// Test that submissions may be dropped, and the responses associated with them
 /// will be discarded.
 #[tokio::test]
@@ -73,6 +38,25 @@ async fn drop_test() {
     assert_eq!(slot2.await.unwrap(), 2);
     drop(slot4);
     assert_eq!(slot5.await.unwrap(), 5);
+}
+
+/// Test that submit_owned works in a futures-chaining style
+#[tokio::test]
+async fn test_owned_drop_chain() {
+    let (send, recv) = mpsc::unbounded();
+    let pipeline = Pipeline::new(send, recv);
+
+    let value = pipeline
+        .submit_owned(1)
+        .then(|(pipe, _res)| pipe.submit_owned(2))
+        .then(|(pipe, _res)| pipe.submit_owned(3))
+        .then(|(pipe, _res)| pipe.submit_owned(4))
+        .then(|(pipe, _res)| pipe.submit_owned(5))
+        .then(|(_pipe, res)| res.unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(value, 5);
 }
 
 /// Test that submissions must be resolved in order; that is, subsequent
