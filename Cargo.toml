@@ -1,8 +1,13 @@
 [package]
-name = "request-stream"
+name = "pipette"
 version = "0.1.0"
 authors = ["Nathan West <Lucretiel@gmail.com>"]
 edition = "2018"
+
+readme = "README.md"
+license = "MPL-2.0"
+description = "An async abstraction to pipeline requests through a channel"
+repository = "https://github.com/Lucretiel/lazy_format"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
