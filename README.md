@@ -155,9 +155,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 [redis]: https://redis.io/
 [redis protocol]: https://redis.io/topics/protocol
-[`pipeline`]: https://docs.rs/plumbing/0.9.0/plumbing/struct.Pipeline.html
-[`resolver`]: https://docs.rs/plumbing/0.9.0/plumbing/struct.Resolver.html
-[`sink`]: https://docs.rs/futures/0.3.5/futures/sink/trait.Sink.html
-[`stream`]: https://docs.rs/futures/0.3.5/futures/stream/trait.Stream.html
+[`pipeline`]: https://docs.rs/plumbing/latest/plumbing/struct.Pipeline.html
+[`resolver`]: https://docs.rs/plumbing/latest/plumbing/struct.Resolver.html
+[`sink`]: https://docs.rs/futures/latest/futures/sink/trait.Sink.html
+[`stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
 
 License: MPL-2.0
