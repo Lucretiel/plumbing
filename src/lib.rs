@@ -475,8 +475,8 @@ impl<St: Stream + Unpin> PipelineState<St> {
         }
     }
 
-    async fn pump(&mut self) {
-        future::poll_fn(move |cx| self.poll_pump(cx)).await
+    fn pump<'s>(&'s mut self) -> impl Future<Output = ()> + 's {
+        future::poll_fn(move |cx| self.poll_pump(cx))
     }
 }
 
@@ -635,6 +635,8 @@ impl<Si, St: Stream + Unpin> Pipeline<Si, St> {
     ///
     /// This function returns a `Skip<St>` so that any responses associated
     /// with aborted Resolvers will be skipped.
+    // TODO: Make a flushing version of finish. The only issue is how to handle
+    // errors.
     pub async fn finish(self) -> (Si, Option<Skip<St>>) {
         let stream = match self.state {
             PipelineState::Chain(recv) => recv.await.map(|(stream, skip)| stream.skip(skip)),
