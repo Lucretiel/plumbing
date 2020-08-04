@@ -535,7 +535,8 @@ impl<Si: Unpin, St> Pipeline<Si, St> {
     /// depending on your request/response system, you may also need to be sure
     /// that any incomplete Resolvers are also being awaited so that the
     /// responses can be drained; this method only handles flushing the
-    /// requests side.
+    /// requests side. The [`flush_and`][Pipeline::flush_and] method is a
+    /// helper for this.
     pub async fn flush<T>(&mut self) -> Result<(), Si::Error>
     where
         Si: Sink<T>,
@@ -543,10 +544,11 @@ impl<Si: Unpin, St> Pipeline<Si, St> {
         future::poll_fn(move |cx| self.sink.poll_flush_unpin(cx)).await
     }
 
-    /// Flush the underlying sink while concurrently polling the given future.
-    /// If the flush encounters an error, that error will be returned. If the
+    /// Flush the underlying sink while awaiting polling the given future. If
+    /// the flush encounters an error, that error will be returned. If the
     /// future completes before the flush is finished, the result of the future
-    /// will be returned immediately.
+    /// will be returned immediately. If the flush finishes, this will continue
+    /// blocking until the given future is complete.
     ///
     /// This is a helper function designed to help ensure the requests are
     /// pushed concurrently with reading responses with Resolvers. It tries
