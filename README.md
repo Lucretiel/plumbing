@@ -147,6 +147,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(resp2.unwrap(), Response::Value(6));
 
     Ok(())
+
+
+- `plumbing` is currently `#![no_std]`; it only requires `alloc` in order to
+  function.
 ```
 
 [redis]: https://redis.io/

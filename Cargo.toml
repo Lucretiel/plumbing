@@ -1,6 +1,6 @@
 [package]
 name = "plumbing"
-version = "0.9.0"
+version = "0.9.1"
 authors = ["Nathan West <Lucretiel@gmail.com>"]
 edition = "2018"
 
