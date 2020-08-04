@@ -158,7 +158,6 @@ async fn test_dangling_tail() {
     // the Resolvers) unless submit takes care of polling the tail end of the
     // resolver chain
     for i in 0..10 {
-        eprintln!("Submitting {}...", i);
         let _ = pipeline.submit(i).await.unwrap();
     }
 

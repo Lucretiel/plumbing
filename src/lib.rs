@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 [Redis Protocol]: https://redis.io/topics/protocol
 */
 
-//#![no_std]
+#![no_std]
 
 use core::{
     future::Future,
@@ -214,14 +214,12 @@ impl<St> Future for ChainRecv<St> {
         match ready!(this.recv.poll_unpin(cx)) {
             Err(..) => Poll::Ready(None),
             Ok(ResolverChainItem::Reconnect(recv)) => {
-                eprintln!("Reconnecting...");
                 this.recv = recv.recv;
                 this.skip += recv.skip;
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Ok(ResolverChainItem::Stream { stream, skip }) => {
-                eprintln!("Got stream!");
                 Poll::Ready(Some((stream, this.skip + skip)))
             }
         }
@@ -417,6 +415,8 @@ impl<St: Stream + Unpin> Drop for Resolver<St> {
     }
 }
 
+/// PipelineState manages the receiving end of the Pipeline. This is the end
+/// that is connected to new Resolvers.
 #[derive(Debug)]
 enum PipelineState<St: Stream + Unpin> {
     Chain(ChainRecv<St>),
@@ -433,6 +433,8 @@ impl<St: Stream + Unpin> PipelineState<St> {
     /// but will be unreadied if more resolvers are created.
     fn poll_pump(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match *self {
+            // Chain state: we are waiting for the stream to be delivered from
+            // a prior Resolver
             PipelineState::Chain(ref mut recv) => match ready!(recv.poll_unpin(cx)) {
                 Some((stream, 0)) => {
                     *self = PipelineState::Stream { stream, skip: 0 };
@@ -448,7 +450,13 @@ impl<St: Stream + Unpin> PipelineState<St> {
                     Poll::Ready(())
                 }
             },
+            // Stream state, skip==0: There's no work left to do until a
+            // Resolver takes ownership of the stream to pull a response out
+            // of it
             PipelineState::Stream { skip: 0, .. } => Poll::Ready(()),
+
+            // Stream state, with skips: Poll and discard responses from the
+            // stream
             PipelineState::Stream {
                 ref mut stream,
                 ref mut skip,
@@ -533,7 +541,6 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
     where
         Si: Sink<T>,
     {
-        eprintln!("Received submit");
         let sink = &mut self.sink;
         // Make sure to poll our recv end in case any trailing resolvers were
         // dropped
@@ -665,19 +672,14 @@ where
     type Output = Result<Fg::Output, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        eprintln!("Polling FgBg...");
         let this = self.project();
-        eprintln!("Polling FgBg foreground...");
         match this.foreground.poll(cx) {
             Poll::Ready(output) => Poll::Ready(Ok(output)),
             Poll::Pending if this.background.is_terminated() => Poll::Pending,
-            Poll::Pending => {
-                eprintln!("Pending, polling FgBg background...");
-                match ready!(this.background.poll(cx)) {
-                    Ok(()) => Poll::Pending,
-                    Err(err) => Poll::Ready(Err(err)),
-                }
-            }
+            Poll::Pending => match ready!(this.background.poll(cx)) {
+                Ok(()) => Poll::Pending,
+                Err(err) => Poll::Ready(Err(err)),
+            },
         }
     }
 }
