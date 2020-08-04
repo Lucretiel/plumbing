@@ -220,11 +220,7 @@ mod fake_db_test {
     }
 
     use fake_db::{Request, Response};
-    use futures::{
-        future::{self},
-        sink::SinkExt,
-        FutureExt,
-    };
+    use futures::{future, sink::SinkExt, FutureExt};
     use plumbing::Pipeline;
 
     /// Test a typical interaction with the fake_db
