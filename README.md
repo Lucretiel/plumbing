@@ -150,6 +150,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(resp2.unwrap(), Response::Value(6));
 
     Ok(())
+}
 ```
 
 [redis]: https://redis.io/
