@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let fut = pipeline.submit(Request::Set(10)).await?;
 
     // If we're buffering requests or responses, we may need to make sure
-    // they both are being polled concurrently. We need to poll the flush
+    // they both are being awaited concurrently. We need to await the flush
     // end, to make sure our pipelined requests are being pushed into the
     // service, as well as the response end, to make sure that responses
     // are being pulled. These need to be concurrent, because the service
@@ -124,7 +124,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(response.unwrap(), Response::Ok);
 
     let fut = pipeline.submit(Request::Get).await?;
-    let (_, response) = future::join(pipeline.flush(), fut).await;
+
+    // We can use the flush_and helper to ensure that flush is awaited
+    // concurrently but lazily with the response.
+    let response = pipeline.flush_and(fut).await?;
     assert_eq!(response.unwrap(), Response::Value(10));
 
     // pipeline several requests together
@@ -148,8 +151,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = pipeline.submit(Request::Decr(2)).await?;
     let read2 = pipeline.submit(Request::Get).await?;
 
-    let (_, resp1, resp2) = future::join3(pipeline.flush(), read1, read2).await;
+    // flush_and will only await the flush while the future is pending. This
+    // will resolve as soon as `read1` resolves, regardless of whether the
+    // flush completed.
+    let resp1 = pipeline.flush_and(read1).await?;
     assert_eq!(resp1.unwrap(), Response::Value(10));
+
+    let resp2 = pipeline.flush_and(read2).await?;
     assert_eq!(resp2.unwrap(), Response::Value(6));
 
     Ok(())
@@ -176,6 +184,8 @@ use futures::{
     stream::Skip,
     FutureExt, Sink, SinkExt, Stream, StreamExt,
 };
+
+use pin_project::pin_project;
 
 type ChainSend<St> = oneshot::Sender<ResolverChainItem<St>>;
 
@@ -492,17 +502,67 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
     }
 }
 
+#[pin_project]
+#[derive(Debug)]
+struct FlushAnd<Fl, Fut> {
+    #[pin]
+    flush: future::Fuse<Fl>,
+    #[pin]
+    future: Fut,
+}
+
+impl<E, Fl, Fut> Future for FlushAnd<Fl, Fut>
+where
+    Fl: Future<Output = Result<(), E>>,
+    Fut: Future,
+{
+    type Output = Result<Fut::Output, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.future.poll(cx) {
+            Poll::Ready(output) => Poll::Ready(Ok(output)),
+            Poll::Pending => match this.flush.poll(cx) {
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                _ => Poll::Pending,
+            },
+        }
+    }
+}
+
 impl<Si: Unpin, St> Pipeline<Si, St> {
     /// Flush the underlying `Sink`, blocking until it's finished. Note that,
     /// depending on your request/response system, you may also need to be sure
     /// that any incomplete Resolvers are also being awaited so that the
     /// responses can be drained; this method only handles flushing the
     /// requests side.
-    pub async fn flush<'a, T>(&mut self) -> Result<(), Si::Error>
+    pub async fn flush<T>(&mut self) -> Result<(), Si::Error>
     where
         Si: Sink<T>,
     {
         future::poll_fn(move |cx| self.sink.poll_flush_unpin(cx)).await
+    }
+
+    /// Flush the underlying sink while concurrently polling the given future.
+    /// If the flush encounters an error, that error will be returned. If the
+    /// future completes before the flush is finished, the result of the future
+    /// will be returned immediately.
+    ///
+    /// This is a helper function designed to help ensure the requests are
+    /// pushed concurrently with reading responses with Resolvers. It tries
+    /// to perform a lazy amount of flushing work; it only polls flush while
+    /// the given future hasn't resolved.
+    pub async fn flush_and<T, F>(&mut self, fut: F) -> Result<F::Output, Si::Error>
+    where
+        Si: Sink<T>,
+        F: Future,
+    {
+        let fut = FlushAnd {
+            future: fut,
+            flush: self.flush().fuse(),
+        };
+
+        fut.await
     }
 }
 
