@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 [Redis Protocol]: https://redis.io/topics/protocol
 */
 
-#![no_std]
+//#![no_std]
 
 use core::{
     future::Future,
@@ -214,12 +214,14 @@ impl<St> Future for ChainRecv<St> {
         match ready!(this.recv.poll_unpin(cx)) {
             Err(..) => Poll::Ready(None),
             Ok(ResolverChainItem::Reconnect(recv)) => {
+                eprintln!("Reconnecting...");
                 this.recv = recv.recv;
                 this.skip += recv.skip;
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Ok(ResolverChainItem::Stream { stream, skip }) => {
+                eprintln!("Got stream!");
                 Poll::Ready(Some((stream, this.skip + skip)))
             }
         }
@@ -234,6 +236,7 @@ enum ResolverChainItem<St> {
 
 #[derive(Debug)]
 enum ResolverState<St> {
+    // See Resolver::poll for a description of these states
     Chain {
         recv: ChainRecv<St>,
         send: ChainSend<St>,
@@ -243,9 +246,7 @@ enum ResolverState<St> {
         stream: St,
         send: ChainSend<St>,
     },
-
-    // We should only be in the dead state transiently between transitions,
-    // or after we returned Poll::Ready
+    Disconnect,
     Dead,
 }
 
@@ -296,7 +297,17 @@ impl<St: Stream + Unpin> Future for Resolver<St> {
         //   awaken the context if we can continue to make progress.
 
         match this.state {
+            // We should only be in the dead state transiently between transitions,
+            // or after we returned Poll::Ready
             ResolverState::Dead => panic!("Can't re-poll a completed future"),
+
+            // Disconnect means that the stream was already known to be closed before
+            // this Resolver was even constructed, so we should just immediately
+            // resolve with None.
+            ResolverState::Disconnect => {
+                this.state = ResolverState::Dead;
+                Poll::Ready(None)
+            }
 
             // The chain state means a previous receiver in the chain has the stream
             // right now, and we're waiting for it to eventually come to use. Additionally,
@@ -401,8 +412,63 @@ impl<St: Stream + Unpin> Drop for Resolver<St> {
                 });
             }
 
-            ResolverState::Dead => {}
+            ResolverState::Disconnect | ResolverState::Dead => {}
         };
+    }
+}
+
+#[derive(Debug)]
+enum PipelineState<St: Stream + Unpin> {
+    Chain(ChainRecv<St>),
+    Stream { stream: St, skip: usize },
+    Disconnect,
+}
+
+impl<St: Stream + Unpin> PipelineState<St> {
+    /// Drive the open end of the chain. Poll the receiver to wait for the
+    /// stream again, then poll the stream to retrieve and discard any items
+    /// that need to be skipped. This is used to make sure we don't deadlock
+    /// when submitting new requests, in the event that the tail Resolvers
+    /// were dropped. This returns Ready when there's no more work to be done,
+    /// but will be unreadied if more resolvers are created.
+    fn poll_pump(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match *self {
+            PipelineState::Chain(ref mut recv) => match ready!(recv.poll_unpin(cx)) {
+                Some((stream, 0)) => {
+                    *self = PipelineState::Stream { stream, skip: 0 };
+                    Poll::Ready(())
+                }
+                Some((stream, skip)) => {
+                    *self = PipelineState::Stream { stream, skip };
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                None => {
+                    *self = PipelineState::Disconnect;
+                    Poll::Ready(())
+                }
+            },
+            PipelineState::Stream { skip: 0, .. } => Poll::Ready(()),
+            PipelineState::Stream {
+                ref mut stream,
+                ref mut skip,
+            } => match ready!(stream.poll_next_unpin(cx)) {
+                None => {
+                    *self = PipelineState::Disconnect;
+                    Poll::Ready(())
+                }
+                Some(..) => {
+                    *skip -= 1;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            },
+            PipelineState::Disconnect => Poll::Ready(()),
+        }
+    }
+
+    async fn pump(&mut self) {
+        future::poll_fn(move |cx| self.poll_pump(cx)).await
     }
 }
 
@@ -436,9 +502,9 @@ impl<St: Stream + Unpin> Drop for Resolver<St> {
 ///
 /// [Redis Protocol]: https://redis.io/topics/protocol
 #[derive(Debug)]
-pub struct Pipeline<Si, St> {
+pub struct Pipeline<Si, St: Stream + Unpin> {
     sink: Si,
-    recv: oneshot::Receiver<ResolverChainItem<St>>,
+    state: PipelineState<St>,
 }
 
 impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
@@ -451,17 +517,12 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
     where
         Si: Sink<T>,
     {
-        let (send, recv) = oneshot::channel();
-
-        send.send(ResolverChainItem::Stream {
-            stream: responses,
-            skip: 0,
-        })
-        .unwrap_or_else(|_| unreachable!());
-
         Self {
             sink: requests,
-            recv,
+            state: PipelineState::Stream {
+                stream: responses,
+                skip: 0,
+            },
         }
     }
 
@@ -472,21 +533,34 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
     where
         Si: Sink<T>,
     {
-        future::poll_fn(|cx| self.sink.poll_ready_unpin(cx)).await?;
+        eprintln!("Received submit");
+        let sink = &mut self.sink;
+        // Make sure to poll our recv end in case any trailing resolvers were
+        // dropped
+        ForegroundBackground {
+            // TODO: Open a feature request against futures for async fn Sink::ready()
+            foreground: future::poll_fn(move |cx| sink.poll_ready_unpin(cx)),
+            background: self.state.pump().never_error(),
+        }
+        .await
+        .expect("Unreachable")?;
+
         self.sink.start_send_unpin(item)?;
 
+        // Open a new channel; this is to where the resolver will forward the
+        // stream
         let (send, recv) = oneshot::channel();
+        let recv = ChainRecv::new(recv);
 
-        // Swap out the receive end. We now have a receive end connected to the
-        // previous Resolver, and a send end connected to this.recv
-        let recv = mem::replace(&mut self.recv, recv);
+        // Swap the new recv end for the one we've stored; that previously
+        // stored one will be given to the new Resolver.
+        let state = match mem::replace(&mut self.state, PipelineState::Chain(recv)) {
+            PipelineState::Chain(recv) => ResolverState::Chain { recv, send },
+            PipelineState::Stream { stream, skip } => ResolverState::Stream { stream, skip, send },
+            PipelineState::Disconnect => ResolverState::Disconnect,
+        };
 
-        Ok(Resolver {
-            state: ResolverState::Chain {
-                recv: ChainRecv::new(recv),
-                send,
-            },
-        })
+        Ok(Resolver { state })
     }
 
     /// Submit a request to this `Pipeline`. Same as [`submit`][Pipeline::submit],
@@ -500,37 +574,7 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
         let res = self.submit(item).await;
         (self, res)
     }
-}
 
-#[pin_project]
-#[derive(Debug)]
-struct FlushAnd<Fl, Fut> {
-    #[pin]
-    flush: future::Fuse<Fl>,
-    #[pin]
-    future: Fut,
-}
-
-impl<E, Fl, Fut> Future for FlushAnd<Fl, Fut>
-where
-    Fl: Future<Output = Result<(), E>>,
-    Fut: Future,
-{
-    type Output = Result<Fut::Output, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        match this.future.poll(cx) {
-            Poll::Ready(output) => Poll::Ready(Ok(output)),
-            Poll::Pending => match this.flush.poll(cx) {
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                _ => Poll::Pending,
-            },
-        }
-    }
-}
-
-impl<Si: Unpin, St> Pipeline<Si, St> {
     /// Flush the underlying `Sink`, blocking until it's finished. Note that,
     /// depending on your request/response system, you may also need to be sure
     /// that any incomplete Resolvers are also being awaited so that the
@@ -541,7 +585,14 @@ impl<Si: Unpin, St> Pipeline<Si, St> {
     where
         Si: Sink<T>,
     {
-        future::poll_fn(move |cx| self.sink.poll_flush_unpin(cx)).await
+        // Make sure to poll our recv end in case any trailing resolvers were
+        // dropped
+        ForegroundBackground {
+            foreground: self.sink.flush(),
+            background: self.state.pump().never_error(),
+        }
+        .await
+        .expect("Unreachable")
     }
 
     /// Flush the underlying sink while awaiting polling the given future. If
@@ -559,28 +610,74 @@ impl<Si: Unpin, St> Pipeline<Si, St> {
         Si: Sink<T>,
         F: Future,
     {
-        let fut = FlushAnd {
-            future: fut,
-            flush: self.flush().fuse(),
-        };
-
-        fut.await
+        ForegroundBackground {
+            foreground: fut,
+            background: self.flush().fuse(),
+        }
+        .await
     }
 }
 
-impl<Si, St: Stream> Pipeline<Si, St> {
+impl<Si, St: Stream + Unpin> Pipeline<Si, St> {
     /// Finish the pipeline. Wait for all the Resolvers to complete (or abort),
     /// then return the original sink & stream. If the stream completed during
     /// the resolvers, return None instead of the stream.
     ///
+    /// Note that this method will *not* do any additional request flushing, so
+    /// be sure that all of the remaining resolvers are able to complete.
+    ///
     /// This function returns a `Skip<St>` so that any responses associated
     /// with aborted Resolvers will be skipped.
     pub async fn finish(self) -> (Si, Option<Skip<St>>) {
-        let recv = ChainRecv::new(self.recv);
+        let stream = match self.state {
+            PipelineState::Chain(recv) => recv.await.map(|(stream, skip)| stream.skip(skip)),
+            PipelineState::Stream { stream, skip } => Some(stream.skip(skip)),
+            PipelineState::Disconnect => None,
+        };
 
-        (
-            self.sink,
-            recv.await.map(|(stream, skip)| stream.skip(skip)),
-        )
+        (self.sink, stream)
+    }
+}
+
+/// Helper future for driving a pair of futures concurrently, where we only
+/// care about one of them. This is sort of a hybrid between join() and
+/// select().
+///
+/// The future will poll the foreground future, resolving immediately if it
+/// finishes. It will concurrently poll the background future, but it will only
+/// resolve if that future returns an error. It will not wait for the
+/// background future to resolve, and if the background does resolve with Ok,
+/// it will continue waiting for the foreground future.
+#[pin_project]
+#[derive(Debug)]
+struct ForegroundBackground<Fg, Bg> {
+    #[pin]
+    foreground: Fg,
+    #[pin]
+    background: Bg,
+}
+
+impl<E, Fg, Bg> Future for ForegroundBackground<Fg, Bg>
+where
+    Fg: Future,
+    Bg: Future<Output = Result<(), E>> + FusedFuture,
+{
+    type Output = Result<Fg::Output, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        eprintln!("Polling FgBg...");
+        let this = self.project();
+        eprintln!("Polling FgBg foreground...");
+        match this.foreground.poll(cx) {
+            Poll::Ready(output) => Poll::Ready(Ok(output)),
+            Poll::Pending if this.background.is_terminated() => Poll::Pending,
+            Poll::Pending => {
+                eprintln!("Pending, polling FgBg background...");
+                match ready!(this.background.poll(cx)) {
+                    Ok(()) => Poll::Pending,
+                    Err(err) => Poll::Ready(Err(err)),
+                }
+            }
+        }
     }
 }

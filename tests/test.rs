@@ -146,6 +146,27 @@ async fn test_drain() {
     assert_eq!(value, 5);
 }
 
+/// Test that, if the tail end resolvers are dropped, additional submissions
+/// are not blocked
+#[tokio::test]
+async fn test_dangling_tail() {
+    let (send, recv) = mpsc::channel(2);
+    let mut pipeline = Pipeline::new(send, recv);
+
+    // A naive implementation of submit (which doesn't poll Pipeline::recv)
+    // will deadlock here. This deadlock is insurmountable (because we dropped
+    // the Resolvers) unless submit takes care of polling the tail end of the
+    // resolver chain
+    for i in 0..10 {
+        eprintln!("Submitting {}...", i);
+        let _ = pipeline.submit(i).await.unwrap();
+    }
+
+    let slot = pipeline.submit(10).await.unwrap();
+    let response = slot.await.unwrap();
+    assert_eq!(response, 10);
+}
+
 #[cfg(test)]
 mod fake_db_test {
     /// This module defines a trivial simulated database. This database is
@@ -189,27 +210,22 @@ mod fake_db_test {
                 let mut database = FakeDb { counter: 0 };
 
                 while let Some(request) = recv_req.next().await {
-                    eprintln!("Received request: {:?}", request);
                     match request {
                         Request::Incr(count) => {
                             database.counter += count;
                             send_resp.send(Response::Ok).await.unwrap();
-                            eprintln!("New value: {}; Responded Ok", database.counter);
                         }
                         Request::Decr(count) => {
                             database.counter -= count;
                             send_resp.send(Response::Ok).await.unwrap();
-                            eprintln!("New value: {}; Responded Ok", database.counter);
                         }
                         Request::Set(value) => {
                             database.counter = value;
                             send_resp.send(Response::Ok).await.unwrap();
-                            eprintln!("New value: {}; Responded Ok", database.counter);
                         }
                         Request::Get => {
                             let response = Response::Value(database.counter);
                             send_resp.send(response).await.unwrap();
-                            eprintln!("Responded with {:?}", response);
                         }
                     }
                 }
@@ -232,30 +248,21 @@ mod fake_db_test {
         let send = send.buffer(20);
         let mut pipeline = Pipeline::new(send, recv);
 
-        eprintln!("Submitting write 1/4...");
         let _ = pipeline.submit(Request::Set(10)).await.unwrap();
-
-        eprintln!("Submitting write 2/4...");
         let _ = pipeline.submit(Request::Incr(12)).await.unwrap();
-
-        eprintln!("Submitting write 3/4...");
         let _ = pipeline.submit(Request::Decr(8)).await.unwrap();
-
-        eprintln!("Submitting write 4/4...");
         let _ = pipeline.submit(Request::Incr(100)).await.unwrap();
 
         // TODO: Create a way to peek at the database here, to confirm that we're
         // blocked until a value is received
 
-        eprintln!("Submitting query...");
         let query = pipeline.submit(Request::Get).await.unwrap();
 
         // Because the items are in a buffer, we need to flush them before
         // the query will be ready. However, we also need to make sure the
         // query is pulling data from the database, so we have to drive both
         // futures at once
-        let (query_result, flush_result) = future::join(query, pipeline.flush()).await;
-        flush_result.unwrap();
+        let query_result = pipeline.flush_and(query).await.unwrap();
 
         assert_eq!(query_result.unwrap(), Response::Value(114));
     }
@@ -287,8 +294,10 @@ mod fake_db_test {
         let query2 = query2.unwrap();
 
         // Flush the pipeline and retrieve the query results
-        let (res1, res2, flush_res) = future::join3(query1, query2, pipeline.flush()).await;
-        flush_res.unwrap();
+        let (res1, res2) = pipeline
+            .flush_and(future::join(query1, query2))
+            .await
+            .unwrap();
 
         assert_eq!(res1.unwrap(), Response::Value(14));
         assert_eq!(res2.unwrap(), Response::Value(2));
