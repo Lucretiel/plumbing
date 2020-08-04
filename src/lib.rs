@@ -115,7 +115,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let fut = pipeline.submit(Request::Set(10)).await?;
 
     // If we're buffering requests or responses, we may need to make sure
-    // they both
+    // they both are being polled concurrently. We need to poll the flush
+    // end, to make sure our pipelined requests are being pushed into the
+    // service, as well as the response end, to make sure that responses
+    // are being pulled. These need to be concurrent, because the service
+    // might block reading requests until responses are sent.
     let (_, response) = future::join(pipeline.flush(), fut).await;
     assert_eq!(response.unwrap(), Response::Ok);
 
