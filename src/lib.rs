@@ -28,6 +28,9 @@ subsequent Resolvers will block until prior Resolvers have received responses
 care that both the send or flush end is polled concurrently with the receiving
 end.
 
+`plumbing` is currently `#![no_std]`; it only requires `alloc` in order to
+function.
+
 # Example
 
 This example uses a tokio task to create a fake, single-key database,
@@ -146,11 +149,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(resp2.unwrap(), Response::Value(6));
 
     Ok(())
-
-# Notes
-
-- `plumbing` is currently `#![no_std]`; it only requires `alloc` in order to
-  function.
 ```
 
 [Redis]: https://redis.io/
