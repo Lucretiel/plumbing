@@ -314,29 +314,27 @@ impl<St: Stream + Unpin> Future for Resolver<St> {
             // chain isn't broken (along with a skip count, indicating the total number
             // of items from the stream that are associated with aborted resolvers and
             // need to be discarded).
-            ResolverState::Chain { ref mut recv, .. } => {
-                match ready!(recv.poll_unpin(cx)) {
-                    // Our channel was closed without a send, indicating the stream returned
-                    // None at some point. Clear our state to propagate the None to future
-                    // Resolvers, then return it.
-                    None => {
-                        this.state = ResolverState::Dead;
-                        Poll::Ready(None)
-                    }
-
-                    // The previous Resolver has finished, which means it's our turn to drink
-                    // from the stream. It's sent us the stream, along with a skip count in
-                    // the event it aborted early.
-                    Some((stream, skip)) => match this.state.take() {
-                        ResolverState::Chain { send, .. } => {
-                            this.state = ResolverState::Stream { stream, send, skip };
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                        _ => unreachable!(),
-                    },
+            ResolverState::Chain { ref mut recv, .. } => match ready!(recv.poll_unpin(cx)) {
+                // Our channel was closed without a send, indicating the stream returned
+                // None at some point. Clear our state to propagate the None to future
+                // Resolvers, then return it.
+                None => {
+                    this.state = ResolverState::Dead;
+                    Poll::Ready(None)
                 }
-            }
+
+                // The previous Resolver has finished, which means it's our turn to drink
+                // from the stream. It's sent us the stream, along with a skip count in
+                // the event it aborted early.
+                Some((stream, skip)) => match this.state.take() {
+                    ResolverState::Chain { send, .. } => {
+                        this.state = ResolverState::Stream { stream, send, skip };
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    _ => unreachable!(),
+                },
+            },
 
             // We are the current holder of the stream, so we're waiting for our element.
             // If we have a skip, that means previous Resolvers aborted without resolving,
@@ -346,40 +344,38 @@ impl<St: Stream + Unpin> Future for Resolver<St> {
                 ref mut stream,
                 ref mut skip,
                 ..
-            } => {
-                match ready!(stream.poll_next_unpin(cx)) {
-                    // Stream ended. Clear the state and return the None.
-                    // Clearing the state will close the send channel, which
-                    // will in activate the next Resolver in the chain and
-                    // so on.
-                    None => {
-                        this.state = ResolverState::Dead;
-                        Poll::Ready(None)
-                    }
-
-                    // We got an item, but we still have skips, which means
-                    // it's an item associated with a previous aborted Resolver.
-                    // Update skip and retry the loop.
-                    Some(..) if *skip > 0 => {
-                        *skip -= 1;
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-
-                    // We got our item! Send the stream down the line, then
-                    // clear our own state and return it
-                    Some(item) => match this.state.take() {
-                        ResolverState::Stream { stream, send, .. } => {
-                            // If the send channel is closed, that means that
-                            // it was part of the pipeline, which was dropped.
-                            // we can therefore silently let this send fail.
-                            let _ = send.send(ResolverChainItem::Stream { stream, skip: 0 });
-                            Poll::Ready(Some(item))
-                        }
-                        _ => unreachable!(),
-                    },
+            } => match ready!(stream.poll_next_unpin(cx)) {
+                // Stream ended. Clear the state and return the None.
+                // Clearing the state will close the send channel, which
+                // will in activate the next Resolver in the chain and
+                // so on.
+                None => {
+                    this.state = ResolverState::Dead;
+                    Poll::Ready(None)
                 }
-            }
+
+                // We got an item, but we still have skips, which means
+                // it's an item associated with a previous aborted Resolver.
+                // Update skip and retry the loop.
+                Some(..) if *skip > 0 => {
+                    *skip -= 1;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+
+                // We got our item! Send the stream down the line, then
+                // clear our own state and return it
+                Some(item) => match this.state.take() {
+                    ResolverState::Stream { stream, send, .. } => {
+                        // If the send channel is closed, that means that
+                        // it was part of the pipeline, which was dropped.
+                        // we can therefore silently let this send fail.
+                        let _ = send.send(ResolverChainItem::Stream { stream, skip: 0 });
+                        Poll::Ready(Some(item))
+                    }
+                    _ => unreachable!(),
+                },
+            },
         }
     }
 }
