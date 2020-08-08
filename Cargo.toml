@@ -7,7 +7,7 @@ edition = "2018"
 readme = "README.md"
 license = "MPL-2.0"
 description = "An async abstraction to pipeline requests through a channel"
-repository = "https://github.com/Lucretiel/lazy_format"
+repository = "https://github.com/Lucretiel/plumbing"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
