@@ -211,17 +211,18 @@ impl<St> Future for ChainRecv<St> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        match ready!(this.recv.poll_unpin(cx)) {
-            Err(..) => Poll::Ready(None),
-            Ok(ResolverChainItem::Reconnect(recv)) => {
-                this.recv = recv.recv;
-                this.skip += recv.skip;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Ok(ResolverChainItem::Stream { stream, skip }) => {
-                Poll::Ready(Some((stream, this.skip + skip)))
-            }
+        loop {
+            break match ready!(this.recv.poll_unpin(cx)) {
+                Ok(ResolverChainItem::Reconnect(recv)) => {
+                    this.recv = recv.recv;
+                    this.skip += recv.skip;
+                    continue;
+                }
+                Ok(ResolverChainItem::Stream { stream, skip }) => {
+                    Poll::Ready(Some((stream, this.skip + skip)))
+                }
+                Err(..) => Poll::Ready(None),
+            };
         }
     }
 }
@@ -283,99 +284,81 @@ impl<St: Stream + Unpin> Future for Resolver<St> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        // Some design notes for this function:
-        // - We try to be as conservative as possible with writes. This means
-        //   we don't modify the state until we *know* it's changing; we don't
-        //   .take() the state, process it, and restore it. This allows us
-        //   to ensure the state remains consistent even through ready! calls
-        //   and possible panics.
-        // - We could loop here until we receive a Pending from one of our
-        //   inner polls or until we're ready, but we don't want to starve
-        //   the event loop, so we do at most one state update, then auto
-        //   awaken the context if we can continue to make progress.
+        loop {
+            match this.state {
+                // We should only be in the dead state transiently between transitions,
+                // or after we returned Poll::Ready
+                ResolverState::Dead => panic!("Can't re-poll a completed future"),
 
-        match this.state {
-            // We should only be in the dead state transiently between transitions,
-            // or after we returned Poll::Ready
-            ResolverState::Dead => panic!("Can't re-poll a completed future"),
+                // Disconnect means that the stream was already known to be closed before
+                // this Resolver was even constructed, so we should just immediately
+                // resolve with None.
+                ResolverState::Disconnect => break Poll::Ready(None),
 
-            // Disconnect means that the stream was already known to be closed before
-            // this Resolver was even constructed, so we should just immediately
-            // resolve with None.
-            ResolverState::Disconnect => {
-                this.state = ResolverState::Dead;
-                Poll::Ready(None)
+                // The chain state means a previous receiver in the chain has the stream
+                // right now, and we're waiting for it to eventually come to use. Additionally,
+                // We may receive "reconnect" messages, which indicate that our previous
+                // resolver is aborting and is sending ITS previous resolver to ensure the
+                // chain isn't broken (along with a skip count, indicating the total number
+                // of items from the stream that are associated with aborted resolvers and
+                // need to be discarded).
+                ResolverState::Chain { ref mut recv, .. } => match ready!(recv.poll_unpin(cx)) {
+                    // Our channel was closed without a send, indicating the stream returned
+                    // None at some point. Clear our state to propagate the None to future
+                    // Resolvers, then return it.
+                    None => {
+                        this.state = ResolverState::Dead;
+                        break Poll::Ready(None);
+                    }
+
+                    // The previous Resolver has finished, which means it's our turn to drink
+                    // from the stream. It's sent us the stream, along with a skip count in
+                    // the event it aborted early.
+                    Some((stream, skip)) => match this.state.take() {
+                        ResolverState::Chain { send, .. } => {
+                            this.state = ResolverState::Stream { stream, send, skip };
+                        }
+                        _ => unreachable!(),
+                    },
+                },
+
+                // We are the current holder of the stream, so we're waiting for our element.
+                // If we have a skip, that means previous Resolvers aborted without resolving,
+                // which means that we need to take and discard that many elements before
+                // claiming our own.
+                ResolverState::Stream {
+                    ref mut stream,
+                    ref mut skip,
+                    ..
+                } => match ready!(stream.poll_next_unpin(cx)) {
+                    // Stream ended. Clear the state and return the None.
+                    // Clearing the state will close the send channel, which
+                    // will in activate the next Resolver in the chain and
+                    // so on.
+                    None => {
+                        this.state = ResolverState::Dead;
+                        break Poll::Ready(None);
+                    }
+
+                    // We got an item, but we still have skips, which means
+                    // it's an item associated with a previous aborted Resolver.
+                    // Update skip and retry the loop.
+                    Some(..) if *skip > 0 => *skip -= 1,
+
+                    // We got our item! Send the stream down the line, then
+                    // clear our own state and return it
+                    Some(item) => match this.state.take() {
+                        ResolverState::Stream { stream, send, .. } => {
+                            // If the send channel is closed, that means that
+                            // it was part of the pipeline, which was dropped.
+                            // we can therefore silently let this send fail.
+                            let _ = send.send(ResolverChainItem::Stream { stream, skip: 0 });
+                            break Poll::Ready(Some(item));
+                        }
+                        _ => unreachable!(),
+                    },
+                },
             }
-
-            // The chain state means a previous receiver in the chain has the stream
-            // right now, and we're waiting for it to eventually come to use. Additionally,
-            // We may receive "reconnect" messages, which indicate that our previous
-            // resolver is aborting and is sending ITS previous resolver to ensure the
-            // chain isn't broken (along with a skip count, indicating the total number
-            // of items from the stream that are associated with aborted resolvers and
-            // need to be discarded).
-            ResolverState::Chain { ref mut recv, .. } => match ready!(recv.poll_unpin(cx)) {
-                // Our channel was closed without a send, indicating the stream returned
-                // None at some point. Clear our state to propagate the None to future
-                // Resolvers, then return it.
-                None => {
-                    this.state = ResolverState::Dead;
-                    Poll::Ready(None)
-                }
-
-                // The previous Resolver has finished, which means it's our turn to drink
-                // from the stream. It's sent us the stream, along with a skip count in
-                // the event it aborted early.
-                Some((stream, skip)) => match this.state.take() {
-                    ResolverState::Chain { send, .. } => {
-                        this.state = ResolverState::Stream { stream, send, skip };
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                    _ => unreachable!(),
-                },
-            },
-
-            // We are the current holder of the stream, so we're waiting for our element.
-            // If we have a skip, that means previous Resolvers aborted without resolving,
-            // which means that we need to take and discard that many elements before
-            // claiming our own.
-            ResolverState::Stream {
-                ref mut stream,
-                ref mut skip,
-                ..
-            } => match ready!(stream.poll_next_unpin(cx)) {
-                // Stream ended. Clear the state and return the None.
-                // Clearing the state will close the send channel, which
-                // will in activate the next Resolver in the chain and
-                // so on.
-                None => {
-                    this.state = ResolverState::Dead;
-                    Poll::Ready(None)
-                }
-
-                // We got an item, but we still have skips, which means
-                // it's an item associated with a previous aborted Resolver.
-                // Update skip and retry the loop.
-                Some(..) if *skip > 0 => {
-                    *skip -= 1;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-
-                // We got our item! Send the stream down the line, then
-                // clear our own state and return it
-                Some(item) => match this.state.take() {
-                    ResolverState::Stream { stream, send, .. } => {
-                        // If the send channel is closed, that means that
-                        // it was part of the pipeline, which was dropped.
-                        // we can therefore silently let this send fail.
-                        let _ = send.send(ResolverChainItem::Stream { stream, skip: 0 });
-                        Poll::Ready(Some(item))
-                    }
-                    _ => unreachable!(),
-                },
-            },
         }
     }
 }
