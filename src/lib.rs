@@ -471,7 +471,7 @@ impl<St: Stream + Unpin> PipelineState<St> {
         }
     }
 
-    fn pump<'s>(&'s mut self) -> impl Future<Output = ()> + 's {
+    fn pump(&mut self) -> impl Future<Output = ()> + '_ {
         future::poll_fn(move |cx| self.poll_pump(cx))
     }
 }
@@ -537,18 +537,14 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
     where
         Si: Sink<T>,
     {
-        let sink = &mut self.sink;
         // Make sure to poll our recv end in case any trailing resolvers were
         // dropped
         ForegroundBackground {
-            // TODO: Open a feature request against futures for async fn Sink::ready()
-            foreground: future::poll_fn(move |cx| sink.poll_ready_unpin(cx)),
+            foreground: self.sink.feed(item),
             background: self.state.pump().never_error(),
         }
         .await
         .expect("Unreachable")?;
-
-        self.sink.start_send_unpin(item)?;
 
         // Open a new channel; this is to where the resolver will forward the
         // stream
@@ -654,7 +650,6 @@ impl<Si, St: Stream + Unpin> Pipeline<Si, St> {
 /// background future to resolve, and if the background does resolve with Ok,
 /// it will continue waiting for the foreground future.
 #[pin_project]
-#[derive(Debug)]
 struct ForegroundBackground<Fg, Bg> {
     #[pin]
     foreground: Fg,
