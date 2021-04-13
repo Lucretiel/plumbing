@@ -411,46 +411,32 @@ impl<St: Stream + Unpin> PipelineState<St> {
     /// were dropped. This returns Ready when there's no more work to be done,
     /// but will be unreadied if more resolvers are created.
     fn poll_pump(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        match *self {
-            // Chain state: we are waiting for the stream to be delivered from
-            // a prior Resolver
-            PipelineState::Chain(ref mut recv) => match ready!(recv.poll_unpin(cx)) {
-                Some((stream, 0)) => {
-                    *self = PipelineState::Stream { stream, skip: 0 };
-                    Poll::Ready(())
+        loop {
+            match *self {
+                // Chain state: we are waiting for the stream to be delivered from
+                // a prior Resolver
+                PipelineState::Chain(ref mut recv) => {
+                    *self = match ready!(recv.poll_unpin(cx)) {
+                        Some((stream, skip)) => PipelineState::Stream { stream, skip },
+                        None => PipelineState::Disconnect,
+                    }
                 }
-                Some((stream, skip)) => {
-                    *self = PipelineState::Stream { stream, skip };
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                None => {
-                    *self = PipelineState::Disconnect;
-                    Poll::Ready(())
-                }
-            },
-            // Stream state, skip==0: There's no work left to do until a
-            // Resolver takes ownership of the stream to pull a response out
-            // of it
-            PipelineState::Stream { skip: 0, .. } => Poll::Ready(()),
+                // Stream state, skip==0: There's no work left to do until a
+                // Resolver takes ownership of the stream to pull a response out
+                // of it
+                PipelineState::Stream { skip: 0, .. } => break Poll::Ready(()),
 
-            // Stream state, with skips: Poll and discard responses from the
-            // stream
-            PipelineState::Stream {
-                ref mut stream,
-                ref mut skip,
-            } => match ready!(stream.poll_next_unpin(cx)) {
-                None => {
-                    *self = PipelineState::Disconnect;
-                    Poll::Ready(())
-                }
-                Some(..) => {
-                    *skip -= 1;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            },
-            PipelineState::Disconnect => Poll::Ready(()),
+                // Stream state, with skips: Poll and discard responses from the
+                // stream
+                PipelineState::Stream {
+                    ref mut stream,
+                    ref mut skip,
+                } => match ready!(stream.poll_next_unpin(cx)) {
+                    Some(..) => *skip -= 1,
+                    None => *self = PipelineState::Disconnect,
+                },
+                PipelineState::Disconnect => break Poll::Ready(()),
+            }
         }
     }
 
