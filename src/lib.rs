@@ -177,6 +177,7 @@ use core::{
     task::{Context, Poll},
 };
 
+use foreback::FutureExt as _;
 use futures::{
     channel::oneshot,
     future::{self, FusedFuture},
@@ -184,8 +185,6 @@ use futures::{
     stream::Skip,
     FutureExt, Sink, SinkExt, Stream, StreamExt,
 };
-
-use pin_project::pin_project;
 
 type ChainSend<St> = oneshot::Sender<ResolverChainItem<St>>;
 
@@ -508,12 +507,10 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
     {
         // Make sure to poll our recv end in case any trailing resolvers were
         // dropped
-        ForegroundBackground {
-            foreground: self.sink.feed(item),
-            background: self.state.pump().never_error(),
-        }
-        .await
-        .expect("Unreachable")?;
+        self.sink
+            .feed(item)
+            .with_background(self.state.pump().fuse())
+            .await?;
 
         // Open a new channel; this is to where the resolver will forward the
         // stream
@@ -555,12 +552,10 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
     {
         // Make sure to poll our recv end in case any trailing resolvers were
         // dropped
-        ForegroundBackground {
-            foreground: self.sink.flush(),
-            background: self.state.pump().never_error(),
-        }
-        .await
-        .expect("Unreachable")
+        self.sink
+            .flush()
+            .with_background(self.state.pump().fuse())
+            .await
     }
 
     /// Flush the underlying sink while awaiting polling the given future. If
@@ -578,11 +573,7 @@ impl<Si: Unpin, St: Unpin + Stream> Pipeline<Si, St> {
         Si: Sink<T>,
         F: Future,
     {
-        ForegroundBackground {
-            foreground: fut,
-            background: self.flush().fuse(),
-        }
-        .await
+        fut.with_try_background(self.flush().fuse()).await
     }
 }
 
@@ -606,42 +597,5 @@ impl<Si, St: Stream + Unpin> Pipeline<Si, St> {
         };
 
         (self.sink, stream)
-    }
-}
-
-/// Helper future for driving a pair of futures concurrently, where we only
-/// care about one of them. This is sort of a hybrid between join() and
-/// select().
-///
-/// The future will poll the foreground future, resolving immediately if it
-/// finishes. It will concurrently poll the background future, but it will only
-/// resolve if that future returns an error. It will not wait for the
-/// background future to resolve, and if the background does resolve with Ok,
-/// it will continue waiting for the foreground future.
-#[pin_project]
-struct ForegroundBackground<Fg, Bg> {
-    #[pin]
-    foreground: Fg,
-    #[pin]
-    background: Bg,
-}
-
-impl<E, Fg, Bg> Future for ForegroundBackground<Fg, Bg>
-where
-    Fg: Future,
-    Bg: Future<Output = Result<(), E>> + FusedFuture,
-{
-    type Output = Result<Fg::Output, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        match this.foreground.poll(cx) {
-            Poll::Ready(output) => Poll::Ready(Ok(output)),
-            Poll::Pending if this.background.is_terminated() => Poll::Pending,
-            Poll::Pending => match ready!(this.background.poll(cx)) {
-                Ok(()) => Poll::Pending,
-                Err(err) => Poll::Ready(Err(err)),
-            },
-        }
     }
 }
